@@ -35,7 +35,8 @@ export function sha1Hex(data: Buffer): string {
 
 export function gitObjectId(type: string, bytes: Buffer): string {
   const header = Buffer.from(`${type} ${bytes.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([header, bytes]));
+  // Hash header + body without concatenating a copy of the body first.
+  return createHash('sha1').update(header).update(bytes).digest('hex');
 }
 
 export function nowIso(trialNowSec: number): string {
@@ -96,25 +97,35 @@ export function parsePktLines(buf: Buffer): PktParseResult {
   let sawFlush = false;
   let sawDelim = false;
   let sawResponseEnd = false;
+  // Parse the 4-byte hex length directly from the bytes (no per-line string).
+  const hexVal = (b: number): number => (b >= 48 && b <= 57 ? b - 48 : b >= 97 && b <= 102 ? b - 87 : -1);
   while (off + 4 <= buf.length) {
-    const header = buf.subarray(off, off + 4).toString('ascii');
-    if (header === '0000') {
+    const b0 = buf[off] as number;
+    const b1 = buf[off + 1] as number;
+    const b2 = buf[off + 2] as number;
+    const b3 = buf[off + 3] as number;
+    if (b0 === 48 && b1 === 48 && b2 === 48 && b3 === 48) {
       sawFlush = true;
       off += 4;
       break;
     }
-    if (header === '0001') {
+    if (b0 === 48 && b1 === 48 && b2 === 48 && b3 === 49) {
       sawDelim = true;
       off += 4;
       continue;
     }
-    if (header === '0002') {
+    if (b0 === 48 && b1 === 48 && b2 === 48 && b3 === 50) {
       sawResponseEnd = true;
       off += 4;
       break;
     }
-    const len = parseInt(header, 16);
-    if (Number.isNaN(len) || len < 4 || off + len > buf.length) break;
+    const h0 = hexVal(b0);
+    const h1 = hexVal(b1);
+    const h2 = hexVal(b2);
+    const h3 = hexVal(b3);
+    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) break;
+    const len = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
+    if (len < 4 || off + len > buf.length) break;
     lines.push(buf.subarray(off + 4, off + len));
     off += len;
   }
@@ -354,7 +365,6 @@ export interface Repo {
   pullSeq: number;
   commentSeq: number;
   version: number;
-  advV2: Buffer | null;
   advV0Up: Buffer | null;
   advV0Recv: Buffer | null;
   lsCache: Map<string, Buffer>;
@@ -366,6 +376,8 @@ export interface Repo {
 
 export interface Store {
   token: string;
+  /** Pre-built `Bearer <token>` string, compared directly on every request. */
+  authHeader: string;
   trialNowSec: number;
   repos: Map<string, Repo>;
   reposById: Map<number, Repo>;
@@ -392,6 +404,7 @@ const DEFAULT_LABELS: [string, string, string][] = [
 export function createStore(token: string, trialNowSec: number): Store {
   return {
     token,
+    authHeader: `Bearer ${token}`,
     trialNowSec,
     repos: new Map(),
     reposById: new Map(),
@@ -426,7 +439,6 @@ export function createRepo(store: Store, owner: string, name: string, descriptio
     pullSeq: 0,
     commentSeq: 0,
     version: 0,
-    advV2: null,
     advV0Up: null,
     advV0Recv: null,
     lsCache: new Map(),
@@ -469,7 +481,6 @@ export function getCommit(repo: Repo, oid: string): CommitParsed | undefined {
 
 export function bumpVersion(repo: Repo): void {
   repo.version++;
-  repo.advV2 = null;
   repo.advV0Up = null;
   repo.advV0Recv = null;
   repo.lsCache.clear();
@@ -488,6 +499,9 @@ export function deleteRef(repo: Repo, refname: string): boolean {
 }
 
 export const EMPTY_TREE_OID = gitObjectId('tree', Buffer.alloc(0));
+
+/** Shared empty query params (our code only ever calls .get() on it). */
+export const EMPTY_QUERY = new URLSearchParams();
 
 export function ensureEmptyTree(repo: Repo): void {
   if (!repo.objects.has(EMPTY_TREE_OID)) {
@@ -876,7 +890,7 @@ export function sendError(res: ServerResponse, status: number, store: Store, mes
 
 export function isAuthorized(store: Store, req: IncomingMessage): boolean {
   const auth = req.headers['authorization'];
-  return typeof auth === 'string' && auth === `Bearer ${store.token}`;
+  return typeof auth === 'string' && auth === store.authHeader;
 }
 
 export function parseJsonBody(body: Buffer): { ok: true; value: unknown } | { ok: false } {
@@ -900,18 +914,17 @@ function sortedRefs(repo: Repo): [string, string][] {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
-function buildAdvV2(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    FLUSH_PKT,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine('object-format=sha1\n'),
-    FLUSH_PKT,
-  ]);
-}
+/** The protocol-v2 advertisement is identical for every repo, so build it once. */
+const ADV_V2: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  FLUSH_PKT,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH_PKT,
+]);
 
 function buildAdvV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps =
@@ -945,8 +958,7 @@ export function handleGitInfoRefs(store: Store, req: IncomingMessage, res: Serve
   }
   if (service === 'git-upload-pack') {
     if (req.headers['git-protocol'] === 'version=2') {
-      if (repo.advV2 === null) repo.advV2 = buildAdvV2();
-      sendBuffer(res, 200, store, repo.advV2, 'application/x-git-upload-pack-advertisement');
+      sendBuffer(res, 200, store, ADV_V2, 'application/x-git-upload-pack-advertisement');
       return;
     }
     if (repo.advV0Up === null) repo.advV0Up = buildAdvV0(repo, 'git-upload-pack');
@@ -1074,7 +1086,8 @@ export function handleUploadPack(store: Store, req: IncomingMessage, res: Server
       else if (line === 'unborn') opts.unborn = true;
       else if (line.startsWith('ref-prefix ')) opts.prefixes.push(line.slice(11));
     }
-    const key = JSON.stringify(opts);
+    // Cache key by concatenation (oids/ref names never contain '\n'; faster than JSON).
+    const key = `${opts.peel ? 1 : 0}${opts.symrefs ? 1 : 0}${opts.unborn ? 1 : 0}\n${opts.prefixes.join('\n')}`;
     let out = repo.lsCache.get(key);
     if (out === undefined) {
       out = buildLsRefs(repo, opts);
@@ -1099,7 +1112,8 @@ export function handleUploadPack(store: Store, req: IncomingMessage, res: Server
     sendError(res, 400, store, 'Bad Request');
     return;
   }
-  const key = JSON.stringify(args);
+  // Cache key by concatenation (oids are fixed 40-hex; faster than JSON).
+  const key = `${args.wants.join(',')}\n${args.haves.join(',')}\n${args.shallow.join(',')}\n${args.depth}`;
   let out = repo.fetchCache.get(key);
   if (out === undefined) {
     const result = computeFetch(repo, args.wants, args.haves, args.shallow, args.depth);
@@ -3132,7 +3146,7 @@ export function createForge(options: ForgeOptions): ReturnType<typeof createServ
         const rawUrl = req.url ?? '/';
         const qIndex = rawUrl.indexOf('?');
         const pathname = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
-        const query = qIndex === -1 ? new URLSearchParams() : new URLSearchParams(rawUrl.slice(qIndex + 1));
+        const query = qIndex === -1 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIndex + 1));
         const segments = pathname
           .split('/')
           .filter((s) => s !== '')

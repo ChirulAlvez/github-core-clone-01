@@ -16,11 +16,15 @@ if (ENV_URL === '') {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Normalise the env base URL once (it was re-derived with a regex on every
+// register attempt and every /done poll).
+const ENV_BASE = ENV_URL.replace(/\/+$/, '');
+
 async function register(port: number): Promise<boolean> {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`${ENV_URL.replace(/\/+$/, '')}/register`, {
+      const res = await fetch(`${ENV_BASE}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
@@ -39,7 +43,7 @@ async function waitDone(): Promise<void> {
   let delay = 250;
   for (;;) {
     try {
-      const res = await fetch(`${ENV_URL.replace(/\/+$/, '')}/done`, {
+      const res = await fetch(`${ENV_BASE}/done`, {
         method: 'GET',
         signal: AbortSignal.timeout(30000),
       });
@@ -51,7 +55,9 @@ async function waitDone(): Promise<void> {
       // Transient failure: keep polling.
     }
     await sleep(delay);
-    delay = Math.min(2000, delay * 2);
+    // Poll tighter (cap 500 ms, was 2000 ms) so the entry exits promptly
+    // once the env reports done instead of idling up to 2 s per poll.
+    delay = Math.min(500, delay * 2);
   }
 }
 
